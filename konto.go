@@ -263,6 +263,7 @@ type insertResult struct {
 // Ledger owns the log file, the index, and the insert channel.
 // All public methods are safe for concurrent use.
 type Ledger struct {
+	closeOnce sync.Once
 	path     string
 	doSync   bool
 	file     *os.File
@@ -449,11 +450,14 @@ func (l *Ledger) Verify() (ok bool, badAt uint64, err error) {
 }
 
 // Close drains the writer goroutine, flushes, and syncs.
+// Safe to call more than once; subsequent calls are no-ops.
 func (l *Ledger) Close() {
-	close(l.insertCh)
-	l.bw.Flush()
-	l.file.Sync()
-	l.file.Close()
+	l.closeOnce.Do(func() {
+		close(l.insertCh)
+		l.bw.Flush()
+		l.file.Sync()
+		l.file.Close()
+	})
 }
 
 // ── HTTP handlers ──────────────────────────────────────────────────────────────
