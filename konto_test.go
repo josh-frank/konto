@@ -489,3 +489,137 @@ func TestMultiTable_NoLeakage(t *testing.T) {
 		t.Fatal("different tables should have different offsets")
 	}
 }
+
+// ── B-tree tests ──────────────────────────────────────────────────────────────
+
+func TestBtree_InsertsAndAllOffsets(t *testing.T) {
+	bt := newBtree()
+	for i := uint64(1); i <= 100; i++ {
+		bt.insert(btreeKey{seq: i, ts: int64(i * 1000), offset: int64(i)})
+	}
+	if bt.size != 100 {
+		t.Fatalf("want size 100, got %d", bt.size)
+	}
+	offsets := bt.allOffsets()
+	if len(offsets) != 100 {
+		t.Fatalf("want 100 offsets, got %d", len(offsets))
+	}
+	// Must be in seq order (offset == seq here).
+	for i, o := range offsets {
+		if o != int64(i+1) {
+			t.Fatalf("offsets not ordered: pos %d = %d", i, o)
+		}
+	}
+}
+
+func TestBtree_RangeSeq(t *testing.T) {
+	bt := newBtree()
+	for i := uint64(1); i <= 50; i++ {
+		bt.insert(btreeKey{seq: i, ts: int64(i), offset: int64(i)})
+	}
+	offsets := bt.rangeOffsets(10, 20, 0, 1<<62)
+	if len(offsets) != 11 { // 10..20 inclusive
+		t.Fatalf("want 11, got %d: %v", len(offsets), offsets)
+	}
+	for _, o := range offsets {
+		if o < 10 || o > 20 {
+			t.Fatalf("offset %d out of range [10,20]", o)
+		}
+	}
+}
+
+func TestBtree_RangeTs(t *testing.T) {
+	bt := newBtree()
+	for i := uint64(1); i <= 50; i++ {
+		bt.insert(btreeKey{seq: i, ts: int64(i * 100), offset: int64(i)})
+	}
+	// ts 1000..2000 → seq 10..20
+	offsets := bt.rangeOffsets(0, ^uint64(0), 1000, 2000)
+	if len(offsets) != 11 {
+		t.Fatalf("want 11, got %d", len(offsets))
+	}
+}
+
+func TestBtree_EmptyRange(t *testing.T) {
+	bt := newBtree()
+	for i := uint64(1); i <= 10; i++ {
+		bt.insert(btreeKey{seq: i, ts: int64(i), offset: int64(i)})
+	}
+	offsets := bt.rangeOffsets(100, 200, 0, 1<<62)
+	if len(offsets) != 0 {
+		t.Fatalf("expected empty, got %v", offsets)
+	}
+}
+
+func TestBtree_LargeInsert(t *testing.T) {
+	// Insert enough keys to force multiple splits and tree height > 1.
+	bt := newBtree()
+	const n = 10_000
+	for i := uint64(1); i <= n; i++ {
+		bt.insert(btreeKey{seq: i, ts: int64(i), offset: int64(i)})
+	}
+	offsets := bt.allOffsets()
+	if len(offsets) != n {
+		t.Fatalf("want %d, got %d", n, len(offsets))
+	}
+	for i, o := range offsets {
+		if o != int64(i+1) {
+			t.Fatalf("order broken at index %d: got offset %d", i, o)
+		}
+	}
+}
+
+// ── Range query API tests (via Ledger) ───────────────────────────────────────
+
+func TestRangeQuery_SeqRange(t *testing.T) {
+	l, _ := tmpLedger(t)
+	for i := 1; i <= 10; i++ {
+		mustInsert(t, l, "t", map[string]any{"id": fmt.Sprintf("%d", i), "v": i})
+	}
+	// seq 3..7 → 5 rows
+	offsets := l.ix.queryRange("t", 3, 7, 0, 1<<62, nil)
+	if len(offsets) != 5 {
+		t.Fatalf("want 5, got %d", len(offsets))
+	}
+}
+
+func TestRangeQuery_SeqRangeWithColumnFilter(t *testing.T) {
+	l, _ := tmpLedger(t)
+	for i := 1; i <= 10; i++ {
+		parity := "odd"
+		if i%2 == 0 {
+			parity = "even"
+		}
+		mustInsert(t, l, "t", map[string]any{"id": fmt.Sprintf("%d", i), "parity": parity})
+	}
+	// seq 1..6, parity=even → seq 2,4,6 → 3 rows
+	offsets := l.ix.queryRange("t", 1, 6, 0, 1<<62, map[string]any{"parity": "even"})
+	if len(offsets) != 3 {
+		t.Fatalf("want 3, got %d", len(offsets))
+	}
+}
+
+func TestRangeQuery_FullTable_BtreeOrdered(t *testing.T) {
+	l, _ := tmpLedger(t)
+	for i := 1; i <= 5; i++ {
+		mustInsert(t, l, "t", map[string]any{"id": fmt.Sprintf("%d", i), "v": i})
+	}
+	offsets := l.ix.query("t", nil)
+	if len(offsets) != 5 {
+		t.Fatalf("want 5, got %d", len(offsets))
+	}
+	// Offsets should be monotonically increasing (log is append-only).
+	for i := 1; i < len(offsets); i++ {
+		if offsets[i] <= offsets[i-1] {
+			t.Fatalf("offsets not ordered at index %d: %d <= %d", i, offsets[i], offsets[i-1])
+		}
+	}
+}
+
+func TestRangeQuery_MissingTable(t *testing.T) {
+	l, _ := tmpLedger(t)
+	offsets := l.ix.queryRange("nonexistent", 0, 100, 0, 1<<62, nil)
+	if offsets != nil {
+		t.Fatalf("expected nil, got %v", offsets)
+	}
+}
