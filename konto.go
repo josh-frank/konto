@@ -429,20 +429,6 @@ func (ix *idx) queryRange(table string, seqLo, seqHi uint64, tsLo, tsHi int64, w
 	return result
 }
 
-func (ix *idx) pkExists(table, pkCol, pkVal string) bool {
-	ix.mu.RLock()
-	defer ix.mu.RUnlock()
-	t, ok := ix.data[table]
-	if !ok {
-		return false
-	}
-	colMap, ok := t[pkCol]
-	if !ok {
-		return false
-	}
-	_, exists := colMap[pkVal]
-	return exists
-}
 
 func (ix *idx) tables() []string {
 	ix.mu.RLock()
@@ -468,19 +454,10 @@ type insertResult struct {
 	err   error
 }
 
-type ErrDuplicatePK struct {
-	Table, Col, Val string
-}
-
-func (e *ErrDuplicatePK) Error() string {
-	return fmt.Sprintf("duplicate primary key: %s.%s = %q", e.Table, e.Col, e.Val)
-}
-
 type Ledger struct {
 	closeOnce sync.Once
 	path      string
 	doSync    bool
-	pkCol     string
 	file      *os.File
 	bw        *bufio.Writer
 	ix        *idx
@@ -491,7 +468,7 @@ type Ledger struct {
 
 const genesis = "0000000000000000000000000000000000000000000000000000000000000000"
 
-func Open(path string, chanBuf int, doSync bool, pkCol string) (*Ledger, error) {
+func Open(path string, chanBuf int, doSync bool) (*Ledger, error) {
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0644)
 	if err != nil {
 		return nil, err
@@ -499,7 +476,6 @@ func Open(path string, chanBuf int, doSync bool, pkCol string) (*Ledger, error) 
 	l := &Ledger{
 		path:     path,
 		doSync:   doSync,
-		pkCol:    pkCol,
 		file:     f,
 		bw:       bufio.NewWriterSize(f, 64*1024),
 		ix:       newIdx(),
@@ -554,15 +530,6 @@ func (l *Ledger) writerLoop() {
 }
 
 func (l *Ledger) appendEntry(table string, row map[string]any) (Entry, error) {
-	pkVal, ok := row[l.pkCol]
-	if !ok {
-		return Entry{}, fmt.Errorf("missing primary key column %q", l.pkCol)
-	}
-	pkStr := fmt.Sprintf("%v", pkVal)
-	if l.ix.pkExists(table, l.pkCol, pkStr) {
-		return Entry{}, &ErrDuplicatePK{Table: table, Col: l.pkCol, Val: pkStr}
-	}
-
 	l.seq++
 	ts := time.Now().UnixMilli()
 	hash := computeHash(l.lastHash, l.seq, table, row, ts)
@@ -720,11 +687,7 @@ func (s *server) handleInsert(w http.ResponseWriter, r *http.Request, table stri
 	}
 	e, err := s.l.Insert(table, row)
 	if err != nil {
-		if _, isDup := err.(*ErrDuplicatePK); isDup {
-			writeErr(w, http.StatusConflict, err.Error())
-			return
-		}
-		writeErr(w, http.StatusBadRequest, err.Error())
+		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	writeJSON(w, http.StatusCreated, e)
@@ -787,7 +750,6 @@ func (s *server) handleMeta(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"healthy": true,
-		"pk_col":  s.l.pkCol,
 		"entries": s.l.seq,
 		"tables":  s.l.ix.tables(),
 		"chain":   chain,
@@ -817,16 +779,15 @@ func main() {
 	logPath := flag.String("log",  "append.log", "log file path")
 	doSync  := flag.Bool("sync",   false,        "fsync on every insert")
 	bufSize := flag.Int("buf",     256,          "insert channel buffer depth")
-	pkCol   := flag.String("pk",   "id",         "primary key column name")
 	flag.Parse()
 
-	ledger, err := Open(*logPath, *bufSize, *doSync, *pkCol)
+	ledger, err := Open(*logPath, *bufSize, *doSync)
 	if err != nil {
 		log.Fatalf("open ledger: %v", err)
 	}
 	defer ledger.Close()
 
-	log.Printf("replayed %d entries from %s (pk: %s)", ledger.seq, *logPath, *pkCol)
+	log.Printf("replayed %d entries from %s", ledger.seq, *logPath)
 
 	srv := &server{l: ledger}
 	mux := http.NewServeMux()
@@ -842,7 +803,7 @@ func main() {
 	}
 
 	go func() {
-		log.Printf("konto listening on %s (log: %s, sync: %v, pk: %s)", *addr, *logPath, *doSync, *pkCol)
+		log.Printf("konto listening on %s (log: %s, sync: %v)", *addr, *logPath, *doSync)
 		if err := hs.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("listen: %v", err)
 		}
