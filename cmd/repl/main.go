@@ -1,7 +1,4 @@
-// konto-repl — a SQL-ish REPL for konto
-//
-// Usage:
-//   go run konto-repl.go [-addr http://localhost:7878]
+// SQL-ish REPL for konto
 //
 // Supported statements:
 //   SHOW TABLES
@@ -12,7 +9,6 @@
 //   EXIT / QUIT / \q
 //
 // Zero external dependencies — stdlib only.
-// Build: go build -o konto-repl konto-repl.go
 
 package main
 
