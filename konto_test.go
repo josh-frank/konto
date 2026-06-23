@@ -20,7 +20,7 @@ func tmpLedger(t *testing.T) (*Ledger, string) {
 	f.Close()
 	os.Remove(path) // Open will create it fresh
 
-	l, err := Open(path, 64, false)
+	l, err := Open(path, 64, false, "id")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -70,7 +70,7 @@ func TestCanonicalJSON_Empty(t *testing.T) {
 func TestHashChain_SequentialSeq(t *testing.T) {
 	l, _ := tmpLedger(t)
 	for i := 1; i <= 5; i++ {
-		e := mustInsert(t, l, "t", map[string]any{"i": i})
+		e := mustInsert(t, l, "t", map[string]any{"id": fmt.Sprintf("%d", i), "i": i})
 		if e.Seq != uint64(i) {
 			t.Fatalf("seq: want %d got %d", i, e.Seq)
 		}
@@ -79,8 +79,8 @@ func TestHashChain_SequentialSeq(t *testing.T) {
 
 func TestHashChain_PrevHashLinks(t *testing.T) {
 	l, _ := tmpLedger(t)
-	e1 := mustInsert(t, l, "t", map[string]any{"a": 1})
-	e2 := mustInsert(t, l, "t", map[string]any{"a": 2})
+	e1 := mustInsert(t, l, "t", map[string]any{"id": "h1", "a": 1})
+	e2 := mustInsert(t, l, "t", map[string]any{"id": "h2", "a": 2})
 	if e2.PrevHash != e1.Hash {
 		t.Fatalf("e2.prev != e1.hash\n  prev=%s\n  hash=%s", e2.PrevHash, e1.Hash)
 	}
@@ -88,7 +88,7 @@ func TestHashChain_PrevHashLinks(t *testing.T) {
 
 func TestHashChain_FirstEntryPrevIsGenesis(t *testing.T) {
 	l, _ := tmpLedger(t)
-	e := mustInsert(t, l, "t", map[string]any{"x": 1})
+	e := mustInsert(t, l, "t", map[string]any{"id": "x1", "x": 1})
 	if e.PrevHash != genesis {
 		t.Fatalf("first entry prev should be genesis, got %s", e.PrevHash)
 	}
@@ -96,7 +96,7 @@ func TestHashChain_FirstEntryPrevIsGenesis(t *testing.T) {
 
 func TestHashChain_HashMatchesComputed(t *testing.T) {
 	l, _ := tmpLedger(t)
-	e := mustInsert(t, l, "t", map[string]any{"k": "v"})
+	e := mustInsert(t, l, "t", map[string]any{"id": "k1", "k": "v"})
 	want := computeHash(e.PrevHash, e.Seq, e.Table, e.Row, e.TS)
 	if e.Hash != want {
 		t.Fatalf("stored hash doesn't match recomputed\n  stored=%s\n  want=%s", e.Hash, want)
@@ -108,7 +108,7 @@ func TestHashChain_HashMatchesComputed(t *testing.T) {
 func TestVerify_CleanChain(t *testing.T) {
 	l, _ := tmpLedger(t)
 	for i := 0; i < 10; i++ {
-		mustInsert(t, l, "t", map[string]any{"i": i})
+		mustInsert(t, l, "t", map[string]any{"id": fmt.Sprintf("%d", i), "i": i})
 	}
 	ok, badAt, err := l.Verify()
 	if err != nil {
@@ -142,7 +142,7 @@ func TestVerify_DetectsTampering(t *testing.T) {
 	os.Remove(path)
 	t.Cleanup(func() { os.Remove(path) })
 
-	l, err := Open(path, 64, false)
+	l, err := Open(path, 64, false, "id")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -162,7 +162,7 @@ func TestVerify_DetectsTampering(t *testing.T) {
 	}
 
 	// Re-open: replay may catch it, or Verify will.
-	l2, err := Open(path, 64, false)
+	l2, err := Open(path, 64, false, "id")
 	if err != nil {
 		// Replay caught the tamper — valid detection.
 		t.Logf("Open caught tampering at replay: %v", err)
@@ -191,11 +191,11 @@ func TestVerify_DetectsAppendedRogue(t *testing.T) {
 	os.Remove(path)
 	t.Cleanup(func() { os.Remove(path) })
 
-	l, err := Open(path, 64, false)
+	l, err := Open(path, 64, false, "id")
 	if err != nil {
 		t.Fatal(err)
 	}
-	mustInsert(t, l, "t", map[string]any{"k": "v"})
+	mustInsert(t, l, "t", map[string]any{"id": "1", "k": "v"})
 	l.Close()
 
 	// Append a line with a fake hash.
@@ -203,7 +203,7 @@ func TestVerify_DetectsAppendedRogue(t *testing.T) {
 	fmt.Fprintln(f, `{"seq":999,"table":"t","row":{"k":"evil"},"ts":1,"prev":"bad","hash":"bad"}`)
 	f.Close()
 
-	l2, err := Open(path, 64, false)
+	l2, err := Open(path, 64, false, "id")
 	if err != nil {
 		t.Logf("replay caught rogue entry: %v", err)
 		return
@@ -230,7 +230,7 @@ func tmpLedgerManual(t *testing.T) (*Ledger, string) {
 	f.Close()
 	os.Remove(path)
 
-	l, err := Open(path, 64, false)
+	l, err := Open(path, 64, false, "id")
 	if err != nil {
 		os.Remove(path)
 		t.Fatal(err)
@@ -245,7 +245,7 @@ func TestReplay_RebuildsIndex(t *testing.T) {
 	mustInsert(t, l, "users", map[string]any{"id": "2", "name": "Bob"})
 	l.Close()
 
-	l2, err := Open(path, 64, false)
+	l2, err := Open(path, 64, false, "id")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -260,17 +260,17 @@ func TestReplay_RebuildsIndex(t *testing.T) {
 func TestReplay_SeqContinues(t *testing.T) {
 	l, path := tmpLedgerManual(t)
 	defer os.Remove(path)
-	mustInsert(t, l, "t", map[string]any{"x": 1})
-	mustInsert(t, l, "t", map[string]any{"x": 2})
+	mustInsert(t, l, "t", map[string]any{"id": "x1", "x": 1})
+	mustInsert(t, l, "t", map[string]any{"id": "x2", "x": 2})
 	l.Close()
 
-	l2, err := Open(path, 64, false)
+	l2, err := Open(path, 64, false, "id")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer l2.Close()
 
-	e := mustInsert(t, l2, "t", map[string]any{"x": 3})
+	e := mustInsert(t, l2, "t", map[string]any{"id": "x3", "x": 3})
 	if e.Seq != 3 {
 		t.Fatalf("seq after reload: want 3 got %d", e.Seq)
 	}
@@ -281,7 +281,7 @@ func TestReplay_SeqContinues(t *testing.T) {
 func TestClose_DoublePanic(t *testing.T) {
 	l, path := tmpLedgerManual(t)
 	defer os.Remove(path)
-	mustInsert(t, l, "t", map[string]any{"x": 1})
+	mustInsert(t, l, "t", map[string]any{"id": "1", "x": 1})
 	l.Close()
 
 	defer func() {
@@ -297,8 +297,8 @@ func TestClose_DoublePanic(t *testing.T) {
 
 func TestQuery_ExactMatch(t *testing.T) {
 	l, _ := tmpLedger(t)
-	mustInsert(t, l, "users", map[string]any{"name": "Alice", "city": "NYC"})
-	mustInsert(t, l, "users", map[string]any{"name": "Bob", "city": "LA"})
+	mustInsert(t, l, "users", map[string]any{"id": "q1", "name": "Alice", "city": "NYC"})
+	mustInsert(t, l, "users", map[string]any{"id": "q2", "name": "Bob", "city": "LA"})
 
 	offsets := l.ix.query("users", map[string]any{"name": "Alice"})
 	if len(offsets) != 1 {
@@ -308,9 +308,9 @@ func TestQuery_ExactMatch(t *testing.T) {
 
 func TestQuery_MultiConditionIntersection(t *testing.T) {
 	l, _ := tmpLedger(t)
-	mustInsert(t, l, "u", map[string]any{"name": "Alice", "city": "NYC"})
-	mustInsert(t, l, "u", map[string]any{"name": "Alice", "city": "LA"})
-	mustInsert(t, l, "u", map[string]any{"name": "Bob", "city": "NYC"})
+	mustInsert(t, l, "u", map[string]any{"id": "1", "name": "Alice", "city": "NYC"})
+	mustInsert(t, l, "u", map[string]any{"id": "q3", "name": "Alice", "city": "LA"})
+	mustInsert(t, l, "u", map[string]any{"id": "q4", "name": "Bob", "city": "NYC"})
 
 	offsets := l.ix.query("u", map[string]any{"name": "Alice", "city": "NYC"})
 	if len(offsets) != 1 {
@@ -320,9 +320,9 @@ func TestQuery_MultiConditionIntersection(t *testing.T) {
 
 func TestQuery_NoWhere_ReturnsAll(t *testing.T) {
 	l, _ := tmpLedger(t)
-	mustInsert(t, l, "t", map[string]any{"x": 1})
-	mustInsert(t, l, "t", map[string]any{"x": 2})
-	mustInsert(t, l, "t", map[string]any{"x": 3})
+	mustInsert(t, l, "t", map[string]any{"id": "1", "x": 1})
+	mustInsert(t, l, "t", map[string]any{"id": "2", "x": 2})
+	mustInsert(t, l, "t", map[string]any{"id": "3", "x": 3})
 
 	offsets := l.ix.query("t", nil)
 	if len(offsets) != 3 {
@@ -340,7 +340,7 @@ func TestQuery_MissingTable(t *testing.T) {
 
 func TestQuery_NoMatch(t *testing.T) {
 	l, _ := tmpLedger(t)
-	mustInsert(t, l, "t", map[string]any{"name": "Alice"})
+	mustInsert(t, l, "t", map[string]any{"id": "a1", "name": "Alice"})
 	offsets := l.ix.query("t", map[string]any{"name": "Charlie"})
 	if len(offsets) != 0 {
 		t.Fatalf("expected 0, got %d", len(offsets))
@@ -349,8 +349,8 @@ func TestQuery_NoMatch(t *testing.T) {
 
 func TestQuery_NonUniqueColumn(t *testing.T) {
 	l, _ := tmpLedger(t)
-	mustInsert(t, l, "t", map[string]any{"city": "NYC", "name": "Alice"})
-	mustInsert(t, l, "t", map[string]any{"city": "NYC", "name": "Bob"})
+	mustInsert(t, l, "t", map[string]any{"id": "1", "city": "NYC", "name": "Alice"})
+	mustInsert(t, l, "t", map[string]any{"id": "2", "city": "NYC", "name": "Bob"})
 
 	offsets := l.ix.query("t", map[string]any{"city": "NYC"})
 	if len(offsets) != 2 {
@@ -362,8 +362,8 @@ func TestQuery_NonUniqueColumn(t *testing.T) {
 
 func TestTables_Listed(t *testing.T) {
 	l, _ := tmpLedger(t)
-	mustInsert(t, l, "users", map[string]any{"x": 1})
-	mustInsert(t, l, "orders", map[string]any{"x": 1})
+	mustInsert(t, l, "users", map[string]any{"id": "u1", "x": 1})
+	mustInsert(t, l, "orders", map[string]any{"id": "o1", "x": 1})
 
 	tables := l.ix.tables()
 	if len(tables) != 2 {
@@ -379,7 +379,7 @@ func TestTables_Listed(t *testing.T) {
 
 func TestReadAt_RoundTrip(t *testing.T) {
 	l, _ := tmpLedger(t)
-	mustInsert(t, l, "t", map[string]any{"key": "value"})
+	mustInsert(t, l, "t", map[string]any{"id": "r1", "key": "value"})
 
 	offsets := l.ix.query("t", map[string]any{"key": "value"})
 	if len(offsets) == 0 {
@@ -406,7 +406,7 @@ func TestConcurrentInserts_AllSucceed(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			_, err := l.Insert("t", map[string]any{"i": i})
+			_, err := l.Insert("t", map[string]any{"id": fmt.Sprintf("%d", i), "i": i})
 			if err != nil {
 				errs <- err
 			}
@@ -433,7 +433,7 @@ func TestConcurrentInserts_ChainIntact(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			l.Insert("t", map[string]any{"i": i}) //nolint
+			l.Insert("t", map[string]any{"id": fmt.Sprintf("%d", i), "i": i}) //nolint
 		}(i)
 	}
 	wg.Wait()
@@ -456,7 +456,7 @@ func TestConcurrentInsertsAndQueries(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			l.Insert("t", map[string]any{"i": i}) //nolint
+			l.Insert("t", map[string]any{"id": fmt.Sprintf("%d", i), "i": i}) //nolint
 		}(i)
 	}
 
@@ -476,8 +476,8 @@ func TestConcurrentInsertsAndQueries(t *testing.T) {
 
 func TestMultiTable_NoLeakage(t *testing.T) {
 	l, _ := tmpLedger(t)
-	mustInsert(t, l, "a", map[string]any{"k": "shared"})
-	mustInsert(t, l, "b", map[string]any{"k": "shared"})
+	mustInsert(t, l, "a", map[string]any{"id": "s1", "k": "shared"})
+	mustInsert(t, l, "b", map[string]any{"id": "s1", "k": "shared"})
 
 	offA := l.ix.query("a", map[string]any{"k": "shared"})
 	offB := l.ix.query("b", map[string]any{"k": "shared"})
