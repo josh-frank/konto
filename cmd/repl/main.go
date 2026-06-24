@@ -199,7 +199,7 @@ func exec(st stmt) {
 	switch st.kind {
 
 	case "SHOW_TABLES":
-		m, err := apiGet("/tables")
+		m, err := apiGet("/__konto")
 		if err != nil {
 			errln(err)
 			return
@@ -215,25 +215,34 @@ func exec(st stmt) {
 		fmt.Printf(dim(" %d table(s)\n"), len(tables))
 
 	case "VERIFY":
-		m, err := apiGet("/verify")
+		m, err := apiGet("/__konto")
 		if err != nil {
 			errln(err)
 			return
 		}
-		if ok, _ := m["ok"].(bool); ok {
-			seq := int64(m["seq"].(float64))
+		chain, _ := m["chain"].(map[string]any)
+		if chain == nil {
+			errln(fmt.Errorf("unexpected response"))
+			return
+		}
+		if ok, _ := chain["ok"].(bool); ok {
+			seq := int64(m["entries"].(float64))
 			fmt.Printf("%s chain intact — %s entries\n", green("✓"), bold(strconv.FormatInt(seq, 10)))
 		} else {
-			at := m["tampered_at"]
+			at := chain["tampered_at"]
 			fmt.Printf("%s tampered at seq %s\n", red("✗"), bold(fmt.Sprint(at)))
 		}
 
 	case "SELECT":
-		body := map[string]any{"table": st.table}
+		path := "/" + st.table
 		if len(st.where) > 0 {
-			body["where"] = st.where
+			params := []string{}
+			for k, v := range st.where {
+				params = append(params, fmt.Sprintf("%s=%v", k, v))
+			}
+			path += "?" + strings.Join(params, "&")
 		}
-		m, err := apiPost("/query", body)
+		m, err := apiGet(path)
 		if err != nil {
 			errln(err)
 			return
@@ -264,7 +273,7 @@ func exec(st stmt) {
 		for i, c := range st.cols {
 			row[c] = st.vals[i]
 		}
-		m, err := apiPost("/insert", map[string]any{"table": st.table, "row": row})
+		m, err := apiPost("/"+st.table, row)
 		if err != nil {
 			errln(err)
 			return
@@ -343,7 +352,7 @@ func main() {
 	baseURL = strings.TrimRight(*addr, "/")
 
 	// ping
-	m, err := apiGet("/tables")
+	m, err := apiGet("/__konto")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%s cannot reach konto at %s: %v\n", red("✗"), baseURL, err)
 		os.Exit(1)

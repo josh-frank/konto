@@ -205,7 +205,10 @@ func main() {
 	out  := make(chan map[string]any, 64)
 	errc := make(chan error, 1)
 
-	go imp.Import(f, out, errc)
+	go func() {
+		imp.Import(f, out, errc)
+		errc <- nil // always unblock receiver; Import only sends on error
+	}()
 
 	var inserted, skipped, total int
 	start := time.Now()
