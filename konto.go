@@ -458,7 +458,8 @@ type Ledger struct {
 	closeOnce sync.Once
 	path      string
 	doSync    bool
-	file      *os.File
+	file      *os.File   // write fd (append)
+	rfile     *os.File   // read-only fd for ReadAt; never written
 	bw        *bufio.Writer
 	ix        *idx
 	insertCh  chan insertJob
@@ -482,8 +483,15 @@ func Open(path string, chanBuf int, doSync bool) (*Ledger, error) {
 		insertCh: make(chan insertJob, chanBuf),
 		lastHash: genesis,
 	}
+	rfile, err := os.Open(path)
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	l.rfile = rfile
 	if err := l.replay(); err != nil {
 		f.Close()
+		rfile.Close()
 		return nil, err
 	}
 	go l.writerLoop()
@@ -583,18 +591,31 @@ func (l *Ledger) Insert(table string, row map[string]any) (Entry, error) {
 }
 
 func (l *Ledger) ReadAt(offset int64) (Entry, error) {
-	buf := make([]byte, 4<<20)
-	n, err := l.file.ReadAt(buf, offset)
-	if err != nil && err != io.EOF {
-		return Entry{}, err
-	}
-	if nl := strings.IndexByte(string(buf[:n]), '\n'); nl >= 0 {
-		buf = buf[:nl]
-	} else {
-		buf = buf[:n]
+	// Read one line from the dedicated read fd using a small sliding buffer.
+	// This avoids the 4MB-per-row allocation and races with the write fd.
+	const chunk = 4096
+	var line []byte
+	pos := offset
+	for {
+		buf := make([]byte, chunk)
+		n, err := l.rfile.ReadAt(buf, pos)
+		if n > 0 {
+			if nl := strings.IndexByte(string(buf[:n]), '\n'); nl >= 0 {
+				line = append(line, buf[:nl]...)
+				break
+			}
+			line = append(line, buf[:n]...)
+			pos += int64(n)
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return Entry{}, err
+		}
 	}
 	var e Entry
-	return e, json.Unmarshal(buf, &e)
+	return e, json.Unmarshal(line, &e)
 }
 
 func (l *Ledger) Verify() (ok bool, badAt uint64, err error) {
@@ -629,6 +650,7 @@ func (l *Ledger) Close() {
 		l.bw.Flush()
 		l.file.Sync()
 		l.file.Close()
+		l.rfile.Close()
 	})
 }
 
