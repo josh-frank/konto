@@ -623,3 +623,113 @@ func TestRangeQuery_MissingTable(t *testing.T) {
 		t.Fatalf("expected nil, got %v", offsets)
 	}
 }
+
+// ── trigram tests ─────────────────────────────────────────────────────────────
+
+func TestMakeTrigrams_Basic(t *testing.T) {
+	tgs := makeTrigrams("hello")
+	want := []string{"hel", "ell", "llo"}
+	if len(tgs) != len(want) {
+		t.Fatalf("want %v got %v", want, tgs)
+	}
+	for i, w := range want {
+		if tgs[i] != w {
+			t.Fatalf("pos %d: want %q got %q", i, w, tgs[i])
+		}
+	}
+}
+
+func TestMakeTrigrams_Short(t *testing.T) {
+	if makeTrigrams("hi") != nil {
+		t.Fatal("expected nil for len < 3")
+	}
+	if makeTrigrams("") != nil {
+		t.Fatal("expected nil for empty")
+	}
+}
+
+func TestMakeTrigrams_Lowercase(t *testing.T) {
+	a := makeTrigrams("ABC")
+	b := makeTrigrams("abc")
+	for i := range a {
+		if a[i] != b[i] {
+			t.Fatalf("not lowercased: %v vs %v", a, b)
+		}
+	}
+}
+
+func TestQueryContains_Basic(t *testing.T) {
+	l, _ := tmpLedger(t)
+	mustInsert(t, l, "t", map[string]any{"name": "George Washington"})
+	mustInsert(t, l, "t", map[string]any{"name": "George Bush"})
+	mustInsert(t, l, "t", map[string]any{"name": "Abraham Lincoln"})
+
+	offsets := l.ix.queryContains("t", "name", "George")
+	if len(offsets) != 2 {
+		t.Fatalf("want 2, got %d", len(offsets))
+	}
+}
+
+func TestQueryContains_CaseInsensitive(t *testing.T) {
+	l, _ := tmpLedger(t)
+	mustInsert(t, l, "t", map[string]any{"name": "George Washington"})
+
+	if len(l.ix.queryContains("t", "name", "george")) == 0 {
+		t.Fatal("should match lowercase search")
+	}
+	if len(l.ix.queryContains("t", "name", "GEORGE")) == 0 {
+		t.Fatal("should match uppercase search")
+	}
+}
+
+func TestQueryContains_ShortTerm(t *testing.T) {
+	l, _ := tmpLedger(t)
+	mustInsert(t, l, "t", map[string]any{"name": "Al Gore"})
+	mustInsert(t, l, "t", map[string]any{"name": "Al Capone"})
+	mustInsert(t, l, "t", map[string]any{"name": "Bob Hope"})
+
+	// "Al" is 2 chars — falls back to full column scan
+	offsets := l.ix.queryContains("t", "name", "Al")
+	if len(offsets) < 2 {
+		t.Fatalf("short term fallback: want >=2, got %d", len(offsets))
+	}
+}
+
+func TestQueryContains_NoMatch(t *testing.T) {
+	l, _ := tmpLedger(t)
+	mustInsert(t, l, "t", map[string]any{"name": "Alice"})
+
+	offsets := l.ix.queryContains("t", "name", "xyz")
+	if len(offsets) != 0 {
+		t.Fatalf("expected 0, got %d", len(offsets))
+	}
+}
+
+func TestQueryContains_MissingTable(t *testing.T) {
+	l, _ := tmpLedger(t)
+	if l.ix.queryContains("nope", "name", "foo") != nil {
+		t.Fatal("expected nil for missing table")
+	}
+}
+
+func TestQueryContains_WithSpaces(t *testing.T) {
+	l, _ := tmpLedger(t)
+	mustInsert(t, l, "t", map[string]any{"name": "George W. Bush"})
+	mustInsert(t, l, "t", map[string]any{"name": "George Washington"})
+	mustInsert(t, l, "t", map[string]any{"name": "John Adams"})
+
+	// Search term with a space
+	offsets := l.ix.queryContains("t", "name", "George W")
+	if len(offsets) != 2 {
+		t.Fatalf("want 2 results for 'George W', got %d", len(offsets))
+	}
+}
+
+func TestIntersectOffsets(t *testing.T) {
+	a := []int64{1, 2, 3, 4, 5}
+	b := []int64{2, 4, 6}
+	got := intersectOffsets(a, b)
+	if len(got) != 2 || got[0] != 2 || got[1] != 4 {
+		t.Fatalf("want [2 4], got %v", got)
+	}
+}

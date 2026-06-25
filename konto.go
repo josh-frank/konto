@@ -277,15 +277,47 @@ func (t *btree) rangeOffsets(seqLo, seqHi uint64, tsLo, tsHi int64) []int64 {
 
 type idx struct {
 	mu     sync.RWMutex
-	data   map[string]map[string]map[string][]int64 // table→col→val→offsets
-	btrees map[string]*btree                        // table→btree
+	data     map[string]map[string]map[string][]int64 // table→col→exact_val→offsets
+	trigrams map[string]map[string]map[string][]int64 // table→col→trigram→offsets
+	btrees   map[string]*btree                        // table→btree
 }
 
 func newIdx() *idx {
 	return &idx{
-		data:   make(map[string]map[string]map[string][]int64),
-		btrees: make(map[string]*btree),
+		data:     make(map[string]map[string]map[string][]int64),
+		trigrams: make(map[string]map[string]map[string][]int64),
+		btrees:   make(map[string]*btree),
 	}
+}
+
+// trigrams returns all 3-character windows of s (lowercased).
+// "hello" → ["hel","ell","llo"]. Strings shorter than 3 chars return nil
+// (caller must fall back to full scan).
+func makeTrigrams(s string) []string {
+	s = strings.ToLower(s)
+	if len(s) < 3 {
+		return nil
+	}
+	out := make([]string, 0, len(s)-2)
+	for i := 0; i <= len(s)-3; i++ {
+		out = append(out, s[i:i+3])
+	}
+	return out
+}
+
+// intersect returns the set intersection of a and b as a sorted slice.
+func intersectOffsets(a, b []int64) []int64 {
+	set := make(map[int64]struct{}, len(b))
+	for _, o := range b {
+		set[o] = struct{}{}
+	}
+	var out []int64
+	for _, o := range a {
+		if _, ok := set[o]; ok {
+			out = append(out, o)
+		}
+	}
+	return out
 }
 
 // add indexes one row into both the hash index and the B-tree.
@@ -303,6 +335,22 @@ func (ix *idx) add(table string, row map[string]any, offset int64, seq uint64, t
 			t[col] = make(map[string][]int64)
 		}
 		t[col][vs] = append(t[col][vs], offset)
+	}
+
+	// Trigram index.
+	tr, ok := ix.trigrams[table]
+	if !ok {
+		tr = make(map[string]map[string][]int64)
+		ix.trigrams[table] = tr
+	}
+	for col, val := range row {
+		vs := strings.ToLower(fmt.Sprintf("%v", val))
+		if tr[col] == nil {
+			tr[col] = make(map[string][]int64)
+		}
+		for _, tg := range makeTrigrams(vs) {
+			tr[col][tg] = append(tr[col][tg], offset)
+		}
 	}
 
 	// B-tree index.
@@ -429,6 +477,70 @@ func (ix *idx) queryRange(table string, seqLo, seqHi uint64, tsLo, tsHi int64, w
 	return result
 }
 
+
+
+// queryContains finds offsets where col contains substr using the trigram index,
+// then returns candidates for confirmation by the caller via ReadAt.
+// For terms < 3 chars it falls back to scanning all offsets for that column.
+func (ix *idx) queryContains(table, col, substr string) []int64 {
+	ix.mu.RLock()
+	defer ix.mu.RUnlock()
+
+	substr = strings.ToLower(substr)
+	tgs := makeTrigrams(substr)
+
+	if len(tgs) == 0 {
+		// Short term: return all offsets for this column.
+		t, ok := ix.data[table]
+		if !ok {
+			return nil
+		}
+		colMap, ok := t[col]
+		if !ok {
+			return nil
+		}
+		seen := make(map[int64]struct{})
+		for _, offsets := range colMap {
+			for _, o := range offsets {
+				seen[o] = struct{}{}
+			}
+		}
+		out := make([]int64, 0, len(seen))
+		for o := range seen {
+			out = append(out, o)
+		}
+		sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+		return out
+	}
+
+	// Trigram intersection.
+	tr, ok := ix.trigrams[table]
+	if !ok {
+		return nil
+	}
+	colTr, ok := tr[col]
+	if !ok {
+		return nil
+	}
+	var candidates []int64
+	for i, tg := range tgs {
+		offsets, ok := colTr[tg]
+		if !ok {
+			return nil
+		}
+		if i == 0 {
+			candidates = make([]int64, len(offsets))
+			copy(candidates, offsets)
+		} else {
+			candidates = intersectOffsets(candidates, offsets)
+		}
+		if len(candidates) == 0 {
+			return nil
+		}
+	}
+	sort.Slice(candidates, func(i, j int) bool { return candidates[i] < candidates[j] })
+	return candidates
+}
 
 func (ix *idx) tables() []string {
 	ix.mu.RLock()
@@ -716,13 +828,21 @@ func (s *server) handleInsert(w http.ResponseWriter, r *http.Request, table stri
 }
 
 func (s *server) handleQuery(w http.ResponseWriter, r *http.Request, table string) {
-	rangeParams := map[string]bool{"seq_gte": true, "seq_lte": true, "ts_gte": true, "ts_lte": true}
+	reserved := map[string]bool{"seq_gte": true, "seq_lte": true, "ts_gte": true, "ts_lte": true}
 
-	// Separate range params from column filters.
+	// q is already URL-decoded by r.URL.Query() — spaces etc. work fine.
 	q := r.URL.Query()
 	where := map[string]any{}
+	contains := map[string]string{} // col → substr for trigram/CONTAINS queries
+
 	for col, vals := range q {
-		if !rangeParams[col] {
+		if reserved[col] {
+			continue
+		}
+		if strings.HasSuffix(col, "__contains") {
+			realCol := strings.TrimSuffix(col, "__contains")
+			contains[realCol] = vals[0]
+		} else {
 			where[col] = vals[0]
 		}
 	}
@@ -731,16 +851,33 @@ func (s *server) handleQuery(w http.ResponseWriter, r *http.Request, table strin
 
 	var offsets []int64
 	if hasRange {
-		// B-tree range scan, with optional hash-index column filter.
 		offsets = s.l.ix.queryRange(table, seqLo, seqHi, tsLo, tsHi, where)
 	} else if len(where) > 0 {
-		// Pure exact-match via hash index.
 		offsets = s.l.ix.query(table, where)
 	} else {
-		// Full table — B-tree gives ordered result cheaply.
 		offsets = s.l.ix.query(table, nil)
 	}
 
+	// Apply CONTAINS filters: trigram candidate set → confirm via ReadAt.
+	for col, substr := range contains {
+		candidates := s.l.ix.queryContains(table, col, substr)
+		if len(candidates) == 0 {
+			offsets = nil
+			break
+		}
+		if offsets == nil {
+			// No prior filter — confirm all trigram candidates.
+			offsets = candidates
+		} else {
+			offsets = intersectOffsets(offsets, candidates)
+		}
+		if len(offsets) == 0 {
+			break
+		}
+	}
+
+	// Confirm pass: verify each candidate actually contains the substr
+	// (trigrams have false positives).
 	rows := make([]map[string]any, 0, len(offsets))
 	for _, off := range offsets {
 		e, err := s.l.ReadAt(off)
@@ -748,7 +885,18 @@ func (s *server) handleQuery(w http.ResponseWriter, r *http.Request, table strin
 			log.Printf("readAt %d: %v", off, err)
 			continue
 		}
-		rows = append(rows, e.Row)
+		// Confirm all CONTAINS predicates.
+		match := true
+		for col, substr := range contains {
+			v := strings.ToLower(fmt.Sprintf("%v", e.Row[col]))
+			if !strings.Contains(v, strings.ToLower(substr)) {
+				match = false
+				break
+			}
+		}
+		if match {
+			rows = append(rows, e.Row)
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"table": table,

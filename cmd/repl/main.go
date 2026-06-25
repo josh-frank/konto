@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"regexp"
 	"sort"
@@ -85,12 +86,14 @@ type stmt struct {
 	table string
 	cols  []string
 	vals  []any
-	where map[string]any
+	where    map[string]any
+	contains map[string]string // col → substr for CONTAINS queries
 }
 
 var (
 	reInsert = regexp.MustCompile(`(?i)^INSERT\s+INTO\s+(\w+)\s*\(([^)]+)\)\s+VALUES\s*\((.+)\)\s*;?$`)
 	reSelect = regexp.MustCompile(`(?i)^SELECT\s+\*\s+FROM\s+(\w+)(\s+WHERE\s+(.+?))?\s*;?$`)
+	reContains = regexp.MustCompile(`(?i)^(\w+)\s+CONTAINS\s+(.+)$`)
 )
 
 func parse(raw string) (stmt, error) {
@@ -124,14 +127,21 @@ func parse(raw string) (stmt, error) {
 	if m := reSelect.FindStringSubmatch(s); m != nil {
 		where := map[string]any{}
 		if whereStr := strings.TrimSpace(m[3]); whereStr != "" {
+			contains := map[string]string{}
 			parts := regexp.MustCompile(`(?i)\s+AND\s+`).Split(whereStr, -1)
 			for _, p := range parts {
-				kv := regexp.MustCompile(`\s*=\s*`).Split(strings.TrimSpace(p), 2)
+				p = strings.TrimSpace(p)
+				if cm := reContains.FindStringSubmatch(p); cm != nil {
+					contains[cm[1]] = strings.Trim(strings.TrimSpace(cm[2]), "'\"")
+					continue
+				}
+				kv := regexp.MustCompile(`\s*=\s*`).Split(p, 2)
 				if len(kv) != 2 {
 					return stmt{}, fmt.Errorf("bad WHERE clause: %s", p)
 				}
 				where[strings.TrimSpace(kv[0])] = coerce(strings.TrimSpace(kv[1]))
 			}
+			return stmt{kind: "SELECT", table: m[1], where: where, contains: contains}, nil
 		}
 		return stmt{kind: "SELECT", table: m[1], where: where}, nil
 	}
@@ -234,13 +244,16 @@ func exec(st stmt) {
 		}
 
 	case "SELECT":
+		q := url.Values{}
+		for k, v := range st.where {
+			q.Set(k, fmt.Sprint(v))
+		}
+		for k, v := range st.contains {
+			q.Set(k+"__contains", v)
+		}
 		path := "/" + st.table
-		if len(st.where) > 0 {
-			params := []string{}
-			for k, v := range st.where {
-				params = append(params, fmt.Sprintf("%s=%v", k, v))
-			}
-			path += "?" + strings.Join(params, "&")
+		if len(q) > 0 {
+			path += "?" + q.Encode()
 		}
 		m, err := apiGet(path)
 		if err != nil {
