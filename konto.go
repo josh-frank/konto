@@ -57,6 +57,11 @@ import (
 	"time"
 )
 
+// ── json ──────────────────────────────────────────────────────────────────────
+// jsonDecode is the single call-site for JSON unmarshalling in konto.
+// Swap this to benchmark or replace json implementations (e.g. sonic, json-iterator).
+var jsonDecode = json.Unmarshal
+
 // ── entry ─────────────────────────────────────────────────────────────────────
 
 type Entry struct {
@@ -727,7 +732,7 @@ func (l *Ledger) ReadAt(offset int64) (Entry, error) {
 		}
 	}
 	var e Entry
-	return e, json.Unmarshal(line, &e)
+	return e, jsonDecode(line, &e)
 }
 
 func (l *Ledger) Verify() (ok bool, badAt uint64, err error) {
