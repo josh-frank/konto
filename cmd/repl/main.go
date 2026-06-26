@@ -88,11 +88,14 @@ type stmt struct {
 	vals  []any
 	where    map[string]any
 	contains map[string]string // col → substr for CONTAINS queries
+	limit    int // 0 = no limit
+	page     int // 1-based, requires limit
 }
 
 var (
 	reInsert = regexp.MustCompile(`(?i)^INSERT\s+INTO\s+(\w+)\s*\(([^)]+)\)\s+VALUES\s*\((.+)\)\s*;?$`)
 	reSelect = regexp.MustCompile(`(?i)^SELECT\s+\*\s+FROM\s+(\w+)(\s+WHERE\s+(.+?))?\s*;?$`)
+	reLimitPage = regexp.MustCompile(`(?i)\s+LIMIT\s+(\d+)(?:\s+PAGE\s+(\d+))?`)
 	reContains = regexp.MustCompile(`(?i)^(\w+)\s+CONTAINS\s+(.+)$`)
 )
 
@@ -261,11 +264,30 @@ func exec(st stmt) {
 			return
 		}
 		rawRows, _ := m["rows"].([]any)
+		total := len(rawRows)
+
+		// Apply LIMIT / PAGE slicing client-side.
+		if st.limit > 0 {
+			start := (st.page - 1) * st.limit
+			if start >= total {
+				fmt.Println(dim("(0 rows — page out of range)"))
+				totalPages := (total + st.limit - 1) / st.limit
+				fmt.Printf(dim(" page %d of %d (%d total rows)\n"), st.page, totalPages, total)
+				return
+			}
+			end := start + st.limit
+			if end > total {
+				end = total
+			}
+			rawRows = rawRows[start:end]
+		}
+
 		if len(rawRows) == 0 {
 			fmt.Println(dim("(0 rows)"))
 			return
 		}
-		// collect all column names, preserving first-seen order
+
+		// Collect all column names in sorted order.
 		colSet := map[string]struct{}{}
 		var cols []string
 		for _, r := range rawRows {
@@ -279,7 +301,14 @@ func exec(st stmt) {
 		}
 		sort.Strings(cols)
 		printTable(cols, rawRows)
-		fmt.Printf(dim(" %d row(s)\n"), len(rawRows))
+
+		if st.limit > 0 {
+			totalPages := (total + st.limit - 1) / st.limit
+			fmt.Printf(dim(" %d row(s) — page %d of %d (%d total)\n"),
+				len(rawRows), st.page, totalPages, total)
+		} else {
+			fmt.Printf(dim(" %d row(s)\n"), len(rawRows))
+		}
 
 	case "INSERT":
 		row := map[string]any{}
@@ -341,6 +370,8 @@ func printHelp() {
 		{"SHOW TABLES", "list all tables"},
 		{"VERIFY", "walk the full hash chain"},
 		{"SELECT * FROM <tbl>", "return all rows"},
+		{"SELECT * FROM <tbl> LIMIT 20", "first 20 rows"},
+		{"SELECT * FROM <tbl> LIMIT 20 PAGE 3", "rows 41-60"},
 		{"SELECT * FROM <tbl> WHERE col = 'val' [AND ...]", "exact-match query"},
 		{"INSERT INTO <tbl> (c1, c2) VALUES ('v1', v2)", "append a row"},
 		{"HELP / \\h", "this message"},
