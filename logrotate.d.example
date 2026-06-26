@@ -1,0 +1,8 @@
+/var/log/konto/access.log {
+    daily
+    rotate 14
+    compress
+    missingok
+    notifempty
+    copytruncate    # no signal needed — konto keeps writing, logrotate copies then truncates
+}

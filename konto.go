@@ -942,13 +942,87 @@ func (s *server) handleTable(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+
+// ── access log ────────────────────────────────────────────────────────────────
+
+// logWriter wraps ResponseWriter to capture status code and bytes written,
+// since the stdlib doesn't expose these after the fact.
+type logWriter struct {
+	http.ResponseWriter
+	status int
+	bytes  int
+}
+
+func (lw *logWriter) WriteHeader(code int) {
+	lw.status = code
+	lw.ResponseWriter.WriteHeader(code)
+}
+
+func (lw *logWriter) Write(b []byte) (int, error) {
+	n, err := lw.ResponseWriter.Write(b)
+	lw.bytes += n
+	return n, err
+}
+
+// accessLogger returns a middleware that logs every request in Apache
+// combined log format to both the console and the access log file.
+//
+// Format:
+//   127.0.0.1 - - [02/Jan/2006:15:04:05 -0700] "GET /table HTTP/1.1" 200 1234 "-" "curl/7.88"
+//
+// The file is opened in append mode so logrotate can rename it and send
+// SIGUSR1 (or just let the next open pick up the new file). For true
+// signal-driven reopen, wrap with a tool like apache2-utils copytruncate.
+func accessLogger(next http.Handler, accessLog *os.File) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		lw := &logWriter{ResponseWriter: w, status: http.StatusOK}
+		next.ServeHTTP(lw, r)
+		duration := time.Since(start)
+
+		// Apache combined log format.
+		ip := r.RemoteAddr
+		if i := strings.LastIndex(ip, ":"); i > 0 {
+			ip = ip[:i] // strip port
+		}
+		if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
+			ip = strings.SplitN(fwd, ",", 2)[0]
+		}
+		referer := r.Referer()
+		if referer == "" {
+			referer = "-"
+		}
+		ua := r.UserAgent()
+		if ua == "" {
+			ua = "-"
+		}
+		line := fmt.Sprintf(`%s - - [%s] "%s %s %s" %d %d "%s" "%s" %.3fms`,
+			ip,
+			start.Format("02/Jan/2006:15:04:05 -0700"),
+			r.Method,
+			r.RequestURI,
+			r.Proto,
+			lw.status,
+			lw.bytes,
+			referer,
+			ua,
+			float64(duration.Microseconds())/1000.0,
+		)
+		log.Println(line)
+		if accessLog != nil {
+			fmt.Fprintln(accessLog, line)
+		}
+	})
+}
+
 // ── main ──────────────────────────────────────────────────────────────────────
 
 func main() {
-	addr    := flag.String("addr", ":7878",      "listen address")
-	logPath := flag.String("log",  "append.log", "log file path")
-	doSync  := flag.Bool("sync",   false,        "fsync on every insert")
-	bufSize := flag.Int("buf",     256,          "insert channel buffer depth")
+	addr      := flag.String("addr",       ":7878",      "listen address")
+	logPath   := flag.String("log",        "append.log", "log file path")
+	accessLog := flag.String("access-log", "access.log", "access log path (- to disable)")
+	doSync    := flag.Bool("sync",         false,        "fsync on every insert")
+	bufSize   := flag.Int("buf",           256,          "insert channel buffer depth")
 	flag.Parse()
 
 	ledger, err := Open(*logPath, *bufSize, *doSync)
@@ -959,6 +1033,17 @@ func main() {
 
 	log.Printf("replayed %d entries from %s", ledger.seq, *logPath)
 
+	// Open access log (append, logrotate-friendly).
+	var alogFile *os.File
+	if *accessLog != "-" {
+		alogFile, err = os.OpenFile(*accessLog, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		if err != nil {
+			log.Fatalf("open access log: %v", err)
+		}
+		defer alogFile.Close()
+		log.Printf("access log: %s", *accessLog)
+	}
+
 	srv := &server{l: ledger}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/__konto", srv.handleMeta)
@@ -966,7 +1051,7 @@ func main() {
 
 	hs := &http.Server{
 		Addr:         *addr,
-		Handler:      mux,
+		Handler:      accessLogger(mux, alogFile),
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 30 * time.Second,
 		IdleTimeout:  60 * time.Second,
